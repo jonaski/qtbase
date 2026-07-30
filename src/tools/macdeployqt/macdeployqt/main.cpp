@@ -37,6 +37,11 @@ int main(int argc, char **argv)
         qDebug() << "   -appstore-compliant           : Skip deployment of components that use private API";
         qDebug() << "   -libpath=<path>               : Add the given path to the library search path";
         qDebug() << "   -fs=<filesystem>              : Set the filesystem used for the .dmg disk image (defaults to HFS+)";
+        qDebug() << "   -gstreamer-plugins=<set>      : Which GStreamer plugins to bundle if the app depends on";
+        qDebug() << "                                   libgstreamer-1.0: none (default), all, or list";
+        qDebug() << "   -gstreamer-plugin-list=<names>: Comma-separated GStreamer plugin names to bundle exactly";
+        qDebug() << "                                   (e.g. coreelements,playback,typefindfunctions,audioconvert);";
+        qDebug() << "                                   only used when -gstreamer-plugins=list";
         qDebug() << "";
         qDebug() << "macdeployqt takes an application bundle as input and makes it";
         qDebug() << "self-contained by copying in the Qt frameworks and plugins that";
@@ -51,6 +56,10 @@ int main(int argc, char **argv)
         qDebug() << "when known incompatible plugins are deployed. Use -appstore-compliant ";
         qDebug() << "to skip these plugins. Currently two SQL plugins are known to";
         qDebug() << "be incompatible: qsqlodbc and qsqlpsql.";
+        qDebug() << "";
+        qDebug() << "If the app depends on libgio-2.0, its GIO modules directory (gsettings";
+        qDebug() << "backends, TLS backend, proxy resolvers, volume monitors) is bundled";
+        qDebug() << "automatically.";
         qDebug() << "";
         qDebug() << "See the \"Qt for macOS - Deployment\" topic in the";
         qDebug() << "documentation for more information about deployment on macOS.";
@@ -83,6 +92,8 @@ int main(int argc, char **argv)
     extern bool appstoreCompliant;
     extern bool deployFramework;
     extern bool secureTimestamp;
+    QString gstreamerPluginsValue = QStringLiteral("none");
+    QStringList gstreamerPluginNames;
 
     for (int i = 2; i < argc; ++i) {
         QByteArray argument = QByteArray(argv[i]);
@@ -208,11 +219,46 @@ int main(int argc, char **argv)
             } else {
                 filesystem = argument.mid(index+1);
             }
+        } else if (argument.startsWith(QByteArrayView("-gstreamer-plugin-list"))) {
+            LogDebug() << "Argument found:" << argument;
+            int index = argument.indexOf('=');
+            if (index == -1) {
+                LogError() << "Missing GStreamer plugin names";
+                return 1;
+            } else {
+                const QStringList rawNames = QString::fromLocal8Bit(argument.mid(index + 1)).split(QLatin1Char(','));
+                for (const QString &rawName : rawNames) {
+                    const QString name = rawName.trimmed();
+                    if (!name.isEmpty())
+                        gstreamerPluginNames << name;
+                }
+            }
+        } else if (argument.startsWith(QByteArrayView("-gstreamer-plugins"))) {
+            LogDebug() << "Argument found:" << argument;
+            int index = argument.indexOf('=');
+            if (index == -1) {
+                LogError() << "Missing GStreamer plugin set (expected none, all, or list)";
+                return 1;
+            } else {
+                gstreamerPluginsValue = QString::fromLocal8Bit(argument.mid(index + 1)).trimmed().toLower();
+            }
         } else if (argument.startsWith('-')) {
             LogError() << "Unknown argument" << argument << "\n";
             return 1;
         }
      }
+
+    GStreamerPluginSet gstreamerPluginSet;
+    if (gstreamerPluginsValue == QLatin1String("none")) {
+        gstreamerPluginSet = GStreamerPluginSet::None;
+    } else if (gstreamerPluginsValue == QLatin1String("all")) {
+        gstreamerPluginSet = GStreamerPluginSet::All;
+    } else if (gstreamerPluginsValue == QLatin1String("list")) {
+        gstreamerPluginSet = GStreamerPluginSet::List;
+    } else {
+        LogError() << "Invalid value for -gstreamer-plugins:" << gstreamerPluginsValue << "(expected none, all, or list)";
+        return 1;
+    }
 
     DeploymentInfo deploymentInfo = deployQtFrameworks(appBundlePath, additionalExecutables, useDebugLibs);
 
@@ -267,6 +313,13 @@ int main(int argc, char **argv)
             LogNormal();
             deployPlugins(appBundlePath, deploymentInfo, useDebugLibs);
         }
+    }
+
+    deployGioModules(appBundlePath, deploymentInfo, useDebugLibs);
+
+    if (gstreamerPluginSet != GStreamerPluginSet::None) {
+        if (!deployGStreamerPlugins(appBundlePath, deploymentInfo, gstreamerPluginSet, gstreamerPluginNames, useDebugLibs))
+            return 1;
     }
 
     if (runStripEnabled)

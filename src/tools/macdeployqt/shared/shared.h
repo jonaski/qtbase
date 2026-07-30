@@ -83,15 +83,25 @@ public:
     bool useLoaderPath;
     bool isFramework;
     bool isDebug;
+    QString gioModulesDirectory;
+    QString gstreamerPluginsDirectory;
 
     bool containsModule(const QString &module, const QString &libInFix) const;
 };
 
 inline QDebug operator<<(QDebug debug, const ApplicationBundleInfo &info);
 
+enum class GStreamerPluginSet {
+    None,
+    All,
+    List,
+};
+
 OtoolInfo findDependencyInfo(const QString &binaryPath);
 FrameworkInfo parseOtoolLibraryLine(const QString &line, const QString &appBundlePath, const QList<QString> &rpaths, bool useDebugLibs);
 QString findAppBinary(const QString &appBundlePath);
+QStringList findAppLibraries(const QString &appBundlePath);
+bool copyFilePrintStatus(const QString &from, const QString &to);
 QList<FrameworkInfo> getQtFrameworks(const QString &path, const QString &appBundlePath, const QList<QString> &rpaths, bool useDebugLibs);
 QList<FrameworkInfo> getQtFrameworks(const QStringList &otoolLines, const QString &appBundlePath, const QList<QString> &rpaths, bool useDebugLibs);
 QString copyFramework(const FrameworkInfo &framework, const QString path);
@@ -113,6 +123,8 @@ QSet<QString> codesignBundle(const QString &identity,
 void codesign(const QString &identity, const QString &appBundlePath);
 void createDiskImage(const QString &appBundlePath, const QString &filesystemType);
 void fixupFramework(const QString &appBundlePath);
+void deployGioModules(const QString &appBundlePath, const DeploymentInfo &deploymentInfo, bool useDebugLibs);
+bool deployGStreamerPlugins(const QString &appBundlePath, const DeploymentInfo &deploymentInfo, GStreamerPluginSet pluginSet, const QStringList &pluginNames, bool useDebugLibs);
 
 
 #endif

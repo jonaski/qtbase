@@ -14,6 +14,7 @@
 #include <QStack>
 #include <QDirIterator>
 #include <QLibraryInfo>
+#include <QStandardPaths>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -470,6 +471,29 @@ QStringList findAppBundleFiles(const QString &appBundlePath, bool absolutePath =
     return result;
 }
 
+static bool isMachOFile(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        return false;
+
+    quint32 magic = 0;
+    if (file.read(reinterpret_cast<char *>(&magic), sizeof(magic)) != qint64(sizeof(magic)))
+        return false;
+
+    switch (magic) {
+    case 0xfeedface: // MH_MAGIC
+    case 0xcefaedfe: // MH_CIGAM
+    case 0xfeedfacf: // MH_MAGIC_64
+    case 0xcffaedfe: // MH_CIGAM_64
+    case 0xcafebabe: // FAT_MAGIC
+    case 0xbebafeca: // FAT_CIGAM
+        return true;
+    default:
+        return false;
+    }
+}
+
 QString findEntitlementsFile(const QString& path)
 {
     QDirIterator iter(path, QStringList() << QString::fromLatin1("*.entitlements"),
@@ -591,7 +615,8 @@ QList<FrameworkInfo> getQtFrameworksForPaths(const QStringList &paths, const QSt
 
 QStringList getBinaryDependencies(const QString executablePath,
                                   const QString &path,
-                                  const QList<QString> &additionalBinariesContainingRpaths)
+                                  const QList<QString> &additionalBinariesContainingRpaths,
+                                  const QString &appBundlePath)
 {
     QStringList binaries;
 
@@ -619,17 +644,25 @@ QStringList getBinaryDependencies(const QString executablePath,
                 rpaths.removeDuplicates();
                 rpathsLoaded = true;
             }
-            bool resolved = false;
+            QString resolvedBinary;
+            QString resolvedOutsideBinary;
             for (const QString &rpath : std::as_const(rpaths)) {
                 QString binary = QDir::cleanPath(rpath + "/" + trimmedLine.mid(QStringLiteral("@rpath/").length()));
                 LogDebug() << "Checking for" << binary;
                 if (QFile::exists(binary)) {
-                    binaries.append(binary);
-                    resolved = true;
-                    break;
+                    if (!appBundlePath.isEmpty() && binary.startsWith(appBundlePath)) {
+                        resolvedBinary = binary;
+                        break;
+                    } else if (resolvedOutsideBinary.isEmpty()) {
+                        resolvedOutsideBinary = binary;
+                    }
                 }
             }
-            if (!resolved && !rpaths.isEmpty()) {
+            if (resolvedBinary.isEmpty())
+                resolvedBinary = resolvedOutsideBinary;
+            if (!resolvedBinary.isEmpty()) {
+                binaries.append(resolvedBinary);
+            } else if (!rpaths.isEmpty()) {
                 LogError() << "Cannot resolve rpath" << trimmedLine;
                 LogError() << " using" << rpaths;
             }
@@ -1009,6 +1042,16 @@ DeploymentInfo deployQtFrameworks(QList<FrameworkInfo> frameworks,
             continue;
         }
 
+        if (deploymentInfo.gioModulesDirectory.isEmpty() && framework.binaryName.startsWith("libgio-2.0"_L1)) {
+            const QString candidate = framework.frameworkDirectory + "/gio/modules"_L1;
+            if (QDir(candidate).exists())
+                deploymentInfo.gioModulesDirectory = candidate;
+        } else if (deploymentInfo.gstreamerPluginsDirectory.isEmpty() && framework.binaryName.startsWith("libgstreamer-1.0"_L1)) {
+            const QString candidate = framework.frameworkDirectory + "/gstreamer-1.0"_L1;
+            if (QDir(candidate).exists())
+                deploymentInfo.gstreamerPluginsDirectory = candidate;
+        }
+
         if (!framework.rpathUsed.isEmpty() && !rpathsUsed.contains(framework.rpathUsed)) {
             rpathsUsed.append(framework.rpathUsed);
         }
@@ -1055,6 +1098,8 @@ DeploymentInfo deployQtFrameworks(QList<FrameworkInfo> frameworks,
         if (!framework.rpathUsed.length()) {
             changeIdentification(framework.deployedInstallName, deployedBinaryPath);
         }
+
+        deployRPaths(bundlePath, rpathsUsed, deployedBinaryPath, useLoaderPath);
 
         // Check for framework dependencies
         QList<FrameworkInfo> dependencies = getQtFrameworks(deployedBinaryPath, bundlePath, rpathsUsed, useDebugLibs);
@@ -1256,6 +1301,275 @@ void deployPlugins(const QString &appBundlePath, DeploymentInfo deploymentInfo, 
 
     const QString pluginDestinationPath = appBundlePath + "/" + "Contents/PlugIns";
     deployPlugins(applicationBundle, deploymentInfo.pluginPath, pluginDestinationPath, deploymentInfo, useDebugLibs);
+}
+
+static QString pkgConfigVariable(const QString &package, const QString &variable)
+{
+    const QString executable = qEnvironmentVariable("PKG_CONFIG_EXECUTABLE", u"pkg-config"_s);
+    if (QStandardPaths::findExecutable(executable).isEmpty())
+        return QString();
+
+    QProcess pkgConfig;
+    pkgConfig.start(executable, QStringList() << u"--variable=%1"_s.arg(variable) << package);
+    if (!pkgConfig.waitForFinished(5000) || pkgConfig.exitCode() != 0)
+        return QString();
+    return QString::fromUtf8(pkgConfig.readAllStandardOutput()).trimmed();
+}
+
+static QString findGioModulesDir(const QString &gioModulesDirectory)
+{
+    const QString fromEnv = qEnvironmentVariable("GIO_EXTRA_MODULES");
+    if (!fromEnv.isEmpty() && QDir(fromEnv).exists())
+        return fromEnv;
+
+    const QString fromPkgConfig = pkgConfigVariable(u"gio-2.0"_s, u"libdir"_s);
+    if (!fromPkgConfig.isEmpty()) {
+        const QString candidate = fromPkgConfig + "/gio/modules"_L1;
+        if (QDir(candidate).exists())
+            return candidate;
+    }
+
+    return gioModulesDirectory;
+}
+
+void deployGioModules(const QString &appBundlePath, const DeploymentInfo &deploymentInfo, bool useDebugLibs)
+{
+    bool usesGio = false;
+    for (const QString &lib : findAppLibraries(appBundlePath)) {
+        if (QFileInfo(lib).fileName().startsWith(u"libgio-2.0"_s)) {
+            usesGio = true;
+            break;
+        }
+    }
+    if (!usesGio)
+        return;
+
+    LogNormal() << "";
+    LogNormal() << "Deploying GIO modules";
+
+    const QString modulesDir = findGioModulesDir(deploymentInfo.gioModulesDirectory);
+    if (modulesDir.isEmpty()) {
+        LogWarning() << "Could not find the GIO modules directory";
+        return;
+    }
+
+    const QString destinationDir = appBundlePath + "/Contents/PlugIns/gio/modules"_L1;
+    QDir().mkpath(destinationDir);
+
+    const QStringList moduleFiles = QDir(modulesDir).entryList(QStringList() << u"*.dylib"_s << u"*.so"_s, QDir::Files);
+    for (const QString &moduleFile : moduleFiles) {
+        const QString sourcePath = modulesDir + u'/' + moduleFile;
+        const QString destinationPath = destinationDir + u'/' + moduleFile;
+        if (copyFilePrintStatus(sourcePath, destinationPath)) {
+            runStrip(destinationPath);
+            changeIdentification(u"@rpath/"_s + QFileInfo(destinationPath).fileName(), destinationPath);
+            const QList<FrameworkInfo> frameworks = getQtFrameworks(destinationPath, appBundlePath, deploymentInfo.rpathsUsed, useDebugLibs);
+            deployQtFrameworks(frameworks, appBundlePath, QStringList() << destinationPath, useDebugLibs, deploymentInfo.useLoaderPath);
+        }
+    }
+
+    const QString cache = modulesDir + "/giomodule.cache"_L1;
+    if (QFile::exists(cache))
+        copyFilePrintStatus(cache, destinationDir + "/giomodule.cache"_L1);
+}
+
+static QString findGStreamerPluginsDir(const QString &gstreamerPluginsDirectory)
+{
+    const QString fromEnv = qEnvironmentVariable("GST_PLUGIN_PATH");
+    if (!fromEnv.isEmpty()) {
+        const QStringList paths = fromEnv.split(QDir::listSeparator(), Qt::SkipEmptyParts);
+        for (const QString &path : paths) {
+            if (QDir(path).exists())
+                return path;
+        }
+    }
+
+    const QString fromPkgConfig = pkgConfigVariable(u"gstreamer-1.0"_s, u"pluginsdir"_s);
+    if (!fromPkgConfig.isEmpty() && QDir(fromPkgConfig).exists())
+        return fromPkgConfig;
+
+    return gstreamerPluginsDirectory;
+}
+
+static QString findGstPluginScanner(const QString &pluginsDir)
+{
+    const QString fromEnv = qEnvironmentVariable("GST_PLUGIN_SCANNER");
+    if (!fromEnv.isEmpty() && QFile::exists(fromEnv))
+        return fromEnv;
+
+    const QString fromPkgConfig = pkgConfigVariable(u"gstreamer-1.0"_s, u"pluginscannerdir"_s);
+    if (!fromPkgConfig.isEmpty()) {
+        const QString path = fromPkgConfig + "/gst-plugin-scanner"_L1;
+        if (QFile::exists(path))
+            return path;
+    }
+
+    if (!pluginsDir.isEmpty()) {
+        const QString path = pluginsDir + "/gst-plugin-scanner"_L1;
+        if (QFile::exists(path))
+            return path;
+    }
+
+    return QString();
+}
+
+static QString resolvePluginFile(const QString &pluginName)
+{
+    QProcess gstInspect;
+    gstInspect.start(u"gst-inspect-1.0"_s, QStringList() << pluginName << QStringLiteral("--no-colors"));
+    if (!gstInspect.waitForFinished(15000) || gstInspect.exitCode() != 0)
+        return QString();
+
+    const QStringList lines = QString::fromUtf8(gstInspect.readAllStandardOutput()).split(u'\n');
+    for (const QString &line : lines) {
+        const int marker = line.indexOf("Filename"_L1);
+        if (marker < 0)
+            continue;
+        const QString path = line.mid(marker + int(u"Filename"_s.size())).trimmed();
+        if (!path.isEmpty())
+            return path;
+    }
+    return QString();
+}
+
+static QStringList selectGStreamerPluginFiles(const QString &pluginsDir, GStreamerPluginSet pluginSet, const QStringList &pluginNames)
+{
+    if (pluginSet == GStreamerPluginSet::All) {
+        QStringList result;
+        QDirIterator it(pluginsDir, QStringList() << u"*.dylib"_s << u"*.so"_s, QDir::Files);
+        while (it.hasNext())
+            result << it.next();
+        return result;
+    }
+
+    QStringList result;
+    for (const QString &pluginName : pluginNames) {
+        const QString file = resolvePluginFile(pluginName);
+        if (file.isEmpty()) {
+            LogError() << "Could not find GStreamer plugin named" << pluginName;
+            continue;
+        }
+        if (!result.contains(file))
+            result << file;
+    }
+    return result;
+}
+
+static void deployBinaryAndItsDependencies(const QString &appBundlePath, const DeploymentInfo &deploymentInfo, bool useDebugLibs, const QString &sourcePath, const QString &destinationDir)
+{
+    const QString destinationPath = destinationDir + u'/' + QFileInfo(sourcePath).fileName();
+    if (!copyFilePrintStatus(sourcePath, destinationPath))
+        return;
+
+    runStrip(destinationPath);
+    changeIdentification(u"@rpath/"_s + QFileInfo(destinationPath).fileName(), destinationPath);
+
+    QList<QString> rpathsUsed = deploymentInfo.rpathsUsed;
+    const QStringList binary_rpaths = getBinaryRPaths(sourcePath, true);
+    for (const QString &sourceRPath : binary_rpaths) {
+        if (QDir(sourceRPath).exists() && !rpathsUsed.contains(sourceRPath))
+            rpathsUsed.append(sourceRPath);
+    }
+    deployRPaths(appBundlePath, rpathsUsed, destinationPath, deploymentInfo.useLoaderPath);
+
+    const QList<FrameworkInfo> frameworks = getQtFrameworks(destinationPath, appBundlePath, rpathsUsed, useDebugLibs);
+    deployQtFrameworks(frameworks, appBundlePath, QStringList() << destinationPath, useDebugLibs, deploymentInfo.useLoaderPath);
+}
+
+static QString findLibsoupLibrary()
+{
+    const QString fromEnv = qEnvironmentVariable("LIBSOUP_LIBRARY_PATH");
+    if (!fromEnv.isEmpty()) {
+        if (QFile::exists(fromEnv))
+            return fromEnv;
+        LogWarning() << "LIBSOUP_LIBRARY_PATH is set to" << fromEnv << "but that file does not exist";
+    }
+
+    static const struct { const char *pkgConfigName; const char *soname; } candidates[] = {
+        { "libsoup-3.0", "libsoup-3.0.0.dylib" },
+        { "libsoup-2.4", "libsoup-2.4.1.dylib" },
+    };
+    for (const auto &candidate : candidates) {
+        const QString libdir = pkgConfigVariable(QString::fromLatin1(candidate.pkgConfigName), u"libdir"_s);
+        if (libdir.isEmpty())
+            continue;
+        const QString path = libdir + u'/' + QString::fromLatin1(candidate.soname);
+        if (QFile::exists(path))
+            return path;
+    }
+    return QString();
+}
+
+bool deployGStreamerPlugins(const QString &appBundlePath, const DeploymentInfo &deploymentInfo, GStreamerPluginSet pluginSet, const QStringList &pluginNames, bool useDebugLibs)
+{
+    if (pluginSet == GStreamerPluginSet::None)
+        return true;
+
+    bool usesGStreamer = false;
+    for (const QString &lib : findAppLibraries(appBundlePath)) {
+        if (QFileInfo(lib).fileName().startsWith("libgstreamer-1.0"_L1)) {
+            usesGStreamer = true;
+            break;
+        }
+    }
+    if (!usesGStreamer)
+        return true;
+
+    if (pluginSet == GStreamerPluginSet::List && pluginNames.isEmpty()) {
+        LogError() << "-gstreamer-plugins=list requires -gstreamer-plugin-list=<comma-separated names>";
+        return false;
+    }
+
+    if (pluginSet == GStreamerPluginSet::List && QStandardPaths::findExecutable(u"gst-inspect-1.0"_s).isEmpty()) {
+        LogError() << "gst-inspect-1.0 is required to select specific GStreamer plugins (use -gstreamer-plugins=all to bundle everything without it)";
+        return false;
+    }
+
+    LogNormal() << "";
+    LogNormal() << "Deploying GStreamer plugins";
+
+    const QString pluginsDir = findGStreamerPluginsDir(deploymentInfo.gstreamerPluginsDirectory);
+    if (pluginsDir.isEmpty()) {
+        LogError() << "Could not find the GStreamer 1.0 plugins directory";
+        return false;
+    }
+
+    const QStringList pluginFiles = selectGStreamerPluginFiles(pluginsDir, pluginSet, pluginNames);
+    if (pluginFiles.isEmpty()) {
+        LogWarning() << "No GStreamer plugins were selected for bundling";
+        return true;
+    }
+
+    const QString destinationDir = appBundlePath + "/Contents/PlugIns/gstreamer"_L1;
+    QDir().mkpath(destinationDir);
+
+    LogNormal() << "Bundling" << pluginFiles.size() << "GStreamer plugin(s)...";
+    bool needsLibsoup = false;
+    for (const QString &pluginFile : pluginFiles) {
+        deployBinaryAndItsDependencies(appBundlePath, deploymentInfo, useDebugLibs, pluginFile, destinationDir);
+        if (QFileInfo(pluginFile).fileName().startsWith("libgstsoup"_L1))
+            needsLibsoup = true;
+    }
+
+    if (needsLibsoup) {
+        const QString libsoup = findLibsoupLibrary();
+        if (libsoup.isEmpty()) {
+            LogWarning() << "libgstsoup is bundled but libsoup could not be located to deploy alongside it;"
+                         << "GStreamer's soup elements will fail to load at runtime";
+        } else {
+            LogNormal() << "Deploying" << libsoup << "for libgstsoup (dlopen'd at runtime, not a link-time dependency)";
+            deployBinaryAndItsDependencies(appBundlePath, deploymentInfo, useDebugLibs, libsoup, appBundlePath + "/Contents/Frameworks"_L1);
+        }
+    }
+
+    LogNormal() << "Determining gst-plugin-scanner...";
+    const QString scanner = findGstPluginScanner(pluginsDir);
+    if (scanner.isEmpty())
+        LogWarning() << "Could not find gst-plugin-scanner; external GStreamer plugins may fail to load";
+    else
+        deployBinaryAndItsDependencies(appBundlePath, deploymentInfo, useDebugLibs, scanner, appBundlePath + "/Contents/PlugIns"_L1);
+
+    return true;
 }
 
 void deployQmlImport(const QString &appBundlePath, const QList<QString> &rpaths, const QString &importSourcePath, const QString &importName)
@@ -1477,6 +1791,14 @@ QSet<QString> codesignBundle(const QString &identity,
          pendingBinariesSet.insert(binary);
     }
 
+    const QString frameworksPath = appBundleAbsolutePath + "/Contents/Frameworks/"_L1;
+    const QStringList foundFrameworksDylibs = QDir(frameworksPath).entryList(QStringList() << u"*.dylib"_s, QDir::Files);
+    for (const QString &dylib : foundFrameworksDylibs) {
+        QString dylibPath = frameworksPath + dylib;
+        pendingBinaries.push(dylibPath);
+        pendingBinariesSet.insert(dylibPath);
+    }
+
     // Add frameworks for processing.
     QStringList frameworkPaths = findAppFrameworkPaths(appBundlePath);
     for (const QString &frameworkPath : frameworkPaths) {
@@ -1515,8 +1837,9 @@ QSet<QString> codesignBundle(const QString &identity,
             continue;
 
         // Check if there are unsigned dependencies, sign these first.
-        QStringList dependencies = getBinaryDependencies(rootBinariesPath, binary,
-                                                         additionalBinariesContainingRpaths);
+        QStringList dependencies = isMachOFile(binary)
+            ? getBinaryDependencies(rootBinariesPath, binary, additionalBinariesContainingRpaths, appBundleAbsolutePath)
+            : QStringList();
         dependencies = QSet<QString>(dependencies.begin(), dependencies.end())
             .subtract(signedBinaries)
             .subtract(pendingBinariesSet)
